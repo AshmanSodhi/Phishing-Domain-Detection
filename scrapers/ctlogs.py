@@ -1,40 +1,103 @@
 # scrapers/ctlogs.py
 import requests
 import pandas as pd
-from datetime import datetime
 import time
+import logging
+from datetime import datetime
+
+log = logging.getLogger(__name__)
 
 BRAND_KEYWORDS = [
-    "paypal", "amazon", "google", "apple", "microsoft",
-    "netflix", "instagram", "facebook", "login", "secure",
-    "account", "banking", "verify", "update"
+    "paypal", "amazon", "apple", "microsoft", "netflix",
+    "instagram", "facebook", "login", "secure", "banking",
 ]
 
-def fetch_ct_logs(keywords=BRAND_KEYWORDS):
-    records = []
-    for keyword in keywords:
-        url = f"https://crt.sh/?q=%25{keyword}%25&output=json"
-        print(f"[CT logs] Querying: {keyword}")
-        try:
-            resp = requests.get(url, timeout=30)
-            entries = resp.json()
-            for entry in entries:
-                name = entry.get("name_value", "")
-                for domain in name.split("\n"):
-                    domain = domain.strip().lstrip("*.")
-                    if domain:
-                        records.append({
-                            "url": "http://" + domain,
-                            "domain": domain,
-                            "label": -1,          # unknown — will be labelled in Phase 2
-                            "source": "ct_logs",
-                            "cert_issued_at": entry.get("entry_timestamp"),
-                            "scraped_at": datetime.utcnow().isoformat()
-                        })
-        except Exception as e:
-            print(f"  Error on '{keyword}': {e}")
-        time.sleep(1)  # be polite to crt.sh
+# ── rate limiting config ───────────────────────────────────────────────────
+DELAY_BETWEEN_QUERIES = 2.0    # seconds between each crt.sh query
+MAX_RETRIES           = 3      # retry a failed query this many times
+BACKOFF_FACTOR        = 2.0    # multiply delay by this on each retry
 
-    df = pd.DataFrame(records).drop_duplicates(subset=["domain"])
-    print(f"[CT logs] Collected {len(df)} unique domains")
+
+def _query_crtsh(keyword: str, retries: int = 0) -> list:
+    """
+    Query crt.sh for one keyword. Returns raw list of cert entries.
+    Handles rate limiting with exponential backoff.
+    """
+    url = f"https://crt.sh/?q=%25{keyword}%25&output=json"
+    try:
+        resp = requests.get(url, timeout=30,
+                            headers={"Accept": "application/json"})
+
+        if resp.status_code == 429:
+            wait = DELAY_BETWEEN_QUERIES * (BACKOFF_FACTOR ** retries)
+            log.warning(f"  Rate limited on '{keyword}'. "
+                        f"Waiting {wait:.1f}s before retry...")
+            time.sleep(wait)
+            if retries < MAX_RETRIES:
+                return _query_crtsh(keyword, retries + 1)
+            else:
+                log.error(f"  Giving up on '{keyword}' after {MAX_RETRIES} retries")
+                return []
+
+        if resp.status_code != 200:
+            log.warning(f"  HTTP {resp.status_code} for '{keyword}'")
+            return []
+
+        return resp.json()
+
+    except requests.exceptions.Timeout:
+        log.warning(f"  Timeout on '{keyword}'")
+        if retries < MAX_RETRIES:
+            time.sleep(DELAY_BETWEEN_QUERIES * (BACKOFF_FACTOR ** retries))
+            return _query_crtsh(keyword, retries + 1)
+        return []
+
+    except Exception as e:
+        log.error(f"  Unexpected error on '{keyword}': {e}")
+        return []
+
+
+def fetch_ct_logs(keywords: list = BRAND_KEYWORDS,
+                  delay: float = DELAY_BETWEEN_QUERIES) -> pd.DataFrame:
+    """
+    Scrape crt.sh for all keywords with rate limiting.
+    Returns a deduplicated DataFrame of newly seen domains.
+    """
+    all_records = []
+    total       = len(keywords)
+
+    for i, keyword in enumerate(keywords, 1):
+        log.info(f"[CT logs] ({i}/{total}) Querying: '{keyword}'")
+        entries = _query_crtsh(keyword)
+
+        for entry in entries:
+            raw_names = entry.get("name_value", "")
+            for name in raw_names.split("\n"):
+                domain = name.strip().lstrip("*.").lower()
+                if domain and "." in domain:
+                    all_records.append({
+                        "url":            "http://" + domain,
+                        "domain":         domain,
+                        "label":          -1,
+                        "source":         "ct_logs",
+                        "ct_keyword":     keyword,
+                        "cert_issued_at": entry.get("entry_timestamp"),
+                        "scraped_at":     datetime.utcnow().isoformat(),
+                    })
+
+        log.info(f"  Got {len(entries)} certs so far total")
+
+        # ── polite delay between queries ───────────────────────────────────
+        # Skip delay after the last keyword
+        if i < total:
+            log.info(f"  Waiting {delay}s before next query...")
+            time.sleep(delay)
+
+    df = pd.DataFrame(all_records)
+    if df.empty:
+        return df
+
+    before = len(df)
+    df = df.drop_duplicates(subset=["domain"])
+    log.info(f"[CT logs] {before:,} raw → {len(df):,} unique domains")
     return df
